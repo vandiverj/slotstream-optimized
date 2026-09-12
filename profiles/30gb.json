@@ -1,0 +1,16 @@
+{
+  "name": "30gb",
+  "engine": "engines/30gb",
+  "environment": {
+    "SLOTSTREAM_PREFILL_CHUNK": "2048",
+    "SLOTSTREAM_DRAFT_DEPTH": "1",
+    "SLOTSTREAM_PREFIX_CACHE": "0"
+  },
+  "experts": 152,
+  "mtp": "on",
+  "max_context": 32768,
+  "prefix_cache": false,
+  "memory_target_gb": 30,
+  "reclaimable_reserve_gb": 8,
+  "qualification": "Approximately 30 GB measured on M5 Max; 48 GB M4 Pro qualification pending"
+}

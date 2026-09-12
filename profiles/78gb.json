@@ -1,0 +1,24 @@
+{
+  "name": "78gb",
+  "engine": ".",
+  "environment": {
+    "SLOTSTREAM_ADAPTIVE_DRAFT": "1",
+    "SLOTSTREAM_ATTN_BLOCK": "256",
+    "SLOTSTREAM_COMPILE_EXPERTS": "0",
+    "SLOTSTREAM_DRAFT_DEPTH": "1",
+    "SLOTSTREAM_EXPERT_LOAD_BATCH": "32",
+    "SLOTSTREAM_FULL_RESIDENT_MODE": "both",
+    "SLOTSTREAM_GDN_PREPARE": "gates",
+    "SLOTSTREAM_IO_QUEUE_DEPTH": "12",
+    "SLOTSTREAM_POOL_QUEUE_DEPTH": "32",
+    "SLOTSTREAM_PREFILL_CHUNK": "2048",
+    "SLOTSTREAM_PREFIX_CACHE": "0"
+  },
+  "experts": 512,
+  "mtp": "on",
+  "max_context": 32768,
+  "prefix_cache": false,
+  "memory_target_gb": 78,
+  "reclaimable_reserve_gb": 20,
+  "qualification": "M5 Max 128 GB; 78 GB profile qualified"
+}
