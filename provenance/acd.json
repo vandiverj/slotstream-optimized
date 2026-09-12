@@ -76,5 +76,13 @@
     "Sources/CSlotpack/include/slotpack.h": "07301354bebebac253975abbd5981006be411fed444abab0b6bbc857e28bdd1b",
     "Package.swift": "8e2faec45c5aa764014d61b5cc04dee63640660322ad3e943084d5cb6dee4f87",
     "Package.resolved": "6fc23da3ddc636949e84042cb70da34bc93c4355feef14857880caa6c3c7fceb"
-  }
+  },
+  "baseline": "ACD",
+  "selected_on": "2026-09-12",
+  "measured_packaged_binary_sha256": "1b3132e3682652c875c45fda13b52a8eddd9d2976f00d6d9d0b82e262e5d24ab",
+  "profiles": [
+    "30gb",
+    "78gb"
+  ],
+  "selection": "User selected shared ACD source for both profiles; this supersedes separate baseline engine, not an assertion that ACD wins every workload."
 }

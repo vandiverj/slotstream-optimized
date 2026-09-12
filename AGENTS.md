@@ -1,18 +1,19 @@
-# Standalone optimized Slotstream
+# Standalone ACD baseline
 
-This private repository contains two pinned engines, not an upstream-tracking fork.
-Do not sync or merge upstream updates. Preserve LICENSE and original attribution.
-Do not add experiment directories, benchmark histories, local binaries, model weights,
-credentials, or machine-specific paths to Git.
+This private repository has one ACD engine in Sources/ and two runtime profiles.
+The user selected ACD as the baseline for both 30 GB and 78 GB on 2026-09-12.
+Do not restore the old30GB engine or sync/merge upstream updates.
+Preserve LICENSE and original attribution. Keep model weights, experiment harnesses,
+raw benchmark histories, generated builds, credentials and local paths out of Git.
 
-The root Sources and Package files are the qualified 78 GB engine. engines/30gb
-contains the distinct 30 GB reference engine. Never substitute one for the other.
-Profiles and scripts/serve.py hold the exact launch settings; avoid incidental changes.
-provenance/*.json records source identity. An intentional engine change requires a
-new qualification and provenance update; a successful build alone is not qualification.
+ACD means adaptive MTP, attention 256, compiled GDN gates. Both profiles use the
+same binary.30GB uses 152 experts and full-resident mode off;78GB uses 512 and both.
+Profiles and scripts/serve.py are the supported entrypoint; raw CLI defaults do
+not select ACD. provenance/acd.json pins source identity. Source changes require
+new evidence and intentional provenance updates; a build is not qualification.
 
-Build sequentially with scripts/build.sh PROFILE. Run scripts/verify_sources.py and
-.build/release/slotstream-checks --tier t0 (or the corresponding 30 GB path).
-Never overlap model processes or run a large build alongside an owned model process.
-Check reclaimable memory before heavy work. Keep model downloads outside Git.
-No automated deployment or upstream release workflow is configured.
+Read README.md, docs/CONFIGURATION.md and docs/FINDINGS.md. Build once with
+scripts/build.sh (either profile argument uses the same engine). Verify with
+scripts/verify_sources.py and .build/release/slotstream-checks --tier t0.
+Never overlap model processes or a model and a large build; check headroom first.
+48GB work-Mac qualification is pending. No automatic deployment or release jobs.

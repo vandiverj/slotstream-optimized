@@ -20,5 +20,6 @@
   "prefix_cache": false,
   "memory_target_gb": 78,
   "reclaimable_reserve_gb": 20,
-  "qualification": "M5 Max 128 GB; 78 GB profile qualified"
+  "qualification": "M5 Max 128 GB; 78 GB profile qualified",
+  "baseline": "ACD"
 }

@@ -1,9 +1,17 @@
 {
   "name": "30gb",
-  "engine": "engines/30gb",
+  "engine": ".",
   "environment": {
-    "SLOTSTREAM_PREFILL_CHUNK": "2048",
+    "SLOTSTREAM_ADAPTIVE_DRAFT": "1",
+    "SLOTSTREAM_ATTN_BLOCK": "256",
+    "SLOTSTREAM_COMPILE_EXPERTS": "0",
     "SLOTSTREAM_DRAFT_DEPTH": "1",
+    "SLOTSTREAM_EXPERT_LOAD_BATCH": "32",
+    "SLOTSTREAM_FULL_RESIDENT_MODE": "off",
+    "SLOTSTREAM_GDN_PREPARE": "gates",
+    "SLOTSTREAM_IO_QUEUE_DEPTH": "12",
+    "SLOTSTREAM_POOL_QUEUE_DEPTH": "32",
+    "SLOTSTREAM_PREFILL_CHUNK": "2048",
     "SLOTSTREAM_PREFIX_CACHE": "0"
   },
   "experts": 152,
@@ -12,5 +20,6 @@
   "prefix_cache": false,
   "memory_target_gb": 30,
   "reclaimable_reserve_gb": 8,
-  "qualification": "Approximately 30 GB measured on M5 Max; 48 GB M4 Pro qualification pending"
+  "qualification": "ACD baseline selected 2026-09-12; original software checks passed on M5 Max 128 GB; 48 GB work-Mac validation pending",
+  "baseline": "ACD"
 }

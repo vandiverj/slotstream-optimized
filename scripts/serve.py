@@ -41,7 +41,7 @@ def main():
     # Account for an explicitly selected prefill chunk exceeding the planner's estimate.
     selected_chunk = int(cfg['environment']['SLOTSTREAM_PREFILL_CHUNK'])
     estimated = float(peak[1]) + max(0, selected_chunk - int(chunk[1])) * .0013
-    floor = 82 if args.profile == '78gb' else 30
+    floor = 82 if args.profile == '78gb' else 31
     required = max(floor, estimated) + cfg['reclaimable_reserve_gb']
     if float(available[1]) < required:
         parser.error('Need %.1f GB reclaimable including reserve; doctor reports %s GB. Free memory before launching.' % (required, available[1]))
