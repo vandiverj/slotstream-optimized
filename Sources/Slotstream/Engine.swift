@@ -476,7 +476,6 @@ public final class Engine {
     /// may only load when it genuinely fits on top; a busy machine gets a
     /// refusal it can act on instead of a gigabyte of swap.
     public func ensureVisionTower() throws -> VisionTower {
-        if let vt = visionTower { return vt }
         guard visionAllowed else {
             throw SlotstreamError.vision(
                 "this server was started with --vision off; images are not accepted")
@@ -542,10 +541,13 @@ public final class Engine {
         // 0.9 GB to a tower it may not otherwise need.
         var decoded: [(cg: CGImage, hash: ImageHash)] = []
         decoded.reserveCapacity(sources.count)
+        var pixelBudget = VisionPreprocess.maxSourcePixels
         for (i, source) in sources.enumerated() {
             do {
                 let data = try VisionPreprocess.loadImageData(from: source)
-                decoded.append((try VisionPreprocess.decodeCGImage(data), ImageHash(hashing: data)))
+                let cg = try VisionPreprocess.decodeCGImage(data, pixelBudget: pixelBudget)
+                pixelBudget -= try VisionPreprocess.sourcePixels(width: cg.width, height: cg.height, budget: pixelBudget)
+                decoded.append((cg, ImageHash(hashing: data)))
             } catch {
                 throw SlotstreamError.vision("image \(i + 1): \(error)")
             }

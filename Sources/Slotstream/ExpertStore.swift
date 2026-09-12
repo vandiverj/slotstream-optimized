@@ -4,6 +4,22 @@
 
 import Foundation
 import MLX
+import Cmlx
+
+/// Use the existing C ownership API directly. In pinned mlx-swift 0.31.6,
+/// MLXArray(rawPointer:finalizer:) passRetains a FinalizerCaptureState but its
+/// trampoline never releases that capture. The C managed-buffer path invokes
+/// the same destructor at the same point without allocating a Swift capture.
+package func adoptStagingBuffer(
+    _ pointer: UnsafeMutableRawPointer, shape: [Int], dtype: DType,
+    finalizer: @convention(c) (UnsafeMutableRawPointer?) -> Void = free
+) -> MLXArray {
+    let dimensions = shape.map { Int32($0) }
+    return dimensions.withUnsafeBufferPointer { dimensions in
+        MLXArray(mlx_array_new_data_managed(pointer, dimensions.baseAddress,
+                                          Int32(dimensions.count), dtype.cmlxDtype, finalizer))
+    }
+}
 
 public struct ExpertKey: Hashable {
     public let layer: Int
@@ -217,7 +233,7 @@ public final class ExpertStore {
                 fatalError("unexpected expert dtype \(r.dtype)")
             }
             let owned = buffers[p]
-            out.append(MLXArray(rawPointer: owned, shape, dtype: dtype) { free(owned) })
+            out.append(adoptStagingBuffer(owned, shape: shape, dtype: dtype))
         }
         eval(out)
         return out

@@ -1,5 +1,5 @@
-// T0: pure Swift. No MLX, no GPU, no files, no weights. Everything here runs
-// on any Mac in milliseconds, which is what makes it a gate on every push.
+// T0: model-free Swift policy and local file/socket checks.
+// T1 entries below require the Metal runtime.
 
 import Foundation
 import Slotstream
@@ -15,9 +15,14 @@ extension Catalogue {
             Check("pull-check", tier: .t0) { try Diagnostics.pullIntegrity() },
             Check("machine-planning", tier: .t0) { try Diagnostics.machinePlanning() },
             Check("http-framing", tier: .t0) { Diagnostics.httpFraming() },
+            Check("http-socket-reads", tier: .t0) { try httpSocketReads() },
             Check("http-routing", tier: .t0) { Diagnostics.httpRouting() },
+            Check("server-lifecycle", tier: .t0) { try serverLifecycle() },
+            Check("checkpoint-read", tier: .t0) { try checkpointRead() },
+            Check("router-trace", tier: .t0) { try routerTrace() },
             Check("vision-check", tier: .t0) { Diagnostics.vision() },
             // T1: touches MLX, so it needs the Metal library beside the runner.
+            Check("staging-ownership", tier: .t1) { try stagingOwnership() },
             Check("sampler-behaviour", tier: .t1) { try Diagnostics.samplerBehaviour() },
             Check("vision-splice", tier: .t1) { Diagnostics.visionSplice() },
         ] + toolCallChecks + gatewayChecks + openAIChecks

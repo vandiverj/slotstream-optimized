@@ -273,6 +273,14 @@ public final class Generator {
         // the sampler invent a first token from nothing. Callers reject this at
         // the API boundary; this is the backstop.
         guard !promptIds.isEmpty else { return ([], stats) }
+        // A disconnected request may have waited behind another generation.
+        // Check before taking cached state or running the vision tower, not
+        // only at the first prefill chunk after those allocations and work.
+        if let shouldContinue, !shouldContinue() {
+            stats.promptTokens = promptIds.count
+            stats.finishReason = "stop"
+            return ([], stats)
+        }
         // Vision prompts are cacheable, but not on ids alone: every image
         // expands to a run of the same placeholder id, so a second picture of
         // the same shape produces identical ids. The image segments carry a

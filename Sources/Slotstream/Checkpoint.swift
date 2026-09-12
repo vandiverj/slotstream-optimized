@@ -481,7 +481,10 @@ public final class CheckpointIndex {
         defer { fdLock.unlock() }
         if let f = fds[file] { return f }
         let f = open(file.path, O_RDONLY)
-        precondition(f >= 0, "open \(file.path) failed")
+        guard f >= 0 else {
+            CheckpointRead.abort(file: file.lastPathComponent,
+                                 error: ModelError("open failed: \(String(cString: strerror(errno)))"))
+        }
         _ = fcntl(f, F_NOCACHE, 1)
         _ = fcntl(f, F_RDAHEAD, 0)
         fds[file] = f
@@ -490,12 +493,13 @@ public final class CheckpointIndex {
 
     /// pread `count` bytes at absolute `offset` of `ref`'s file into `dst`.
     public func pread(into dst: UnsafeMutableRawPointer, _ r: TensorRef, offset: Int, count: Int) {
-        var done = 0
-        let f = fd(for: r.file)
-        while done < count {
-            let got = Foundation.pread(f, dst + done, count - done, off_t(r.byteOffset + offset + done))
-            precondition(got > 0, "pread failed at \(r.byteOffset + offset + done): \(String(cString: strerror(errno)))")
-            done += got
+        let (absolute, overflow) = r.byteOffset.addingReportingOverflow(offset)
+        precondition(offset >= 0 && count >= 0 && offset <= r.byteCount
+                     && count <= r.byteCount - offset && !overflow, "invalid tensor read range")
+        do {
+            try CheckpointRead.exactly(fd: fd(for: r.file), into: dst, offset: absolute, count: count)
+        } catch {
+            CheckpointRead.abort(file: r.file.lastPathComponent, error: error)
         }
     }
 }

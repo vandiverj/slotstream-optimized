@@ -12,6 +12,11 @@ public struct ServerError: Error, CustomStringConvertible {
 }
 
 public final class Server {
+    private let lifecycle = ServerLifecycle()
+    // Configured before run by the CLI; zero preserves the baseline policy.
+    package var progressTimeout: TimeInterval = 0
+    package func requestShutdown() { lifecycle.beginShutdown() }
+
     let engine: Engine
     let port: UInt16
     /// Total on-disk size of the weights, reported by /api/tags and /api/ps.
@@ -26,6 +31,8 @@ public final class Server {
         self.weightsBytes = weightsBytes
         self.listenFD = listenFD
     }
+
+    deinit { if listenFD >= 0 { close(listenFD) } }
 
     /// Claim the port. Callers bind *before* loading the model so "address
     /// already in use" — running `serve` twice is the common case — costs a
@@ -65,6 +72,10 @@ public final class Server {
     /// included — which a client cannot tell apart from a crash.
     static let maxConcurrentConnections = 32
     private let connSlots = DispatchSemaphore(value: maxConcurrentConnections)
+    // Include preparation and response delivery, not just the GPU lock: queued
+    // JSON, tokens and decoded images otherwise multiply across all 32 workers.
+    package static let maxInFlightGenerations = 4
+    private let generationSlots = DispatchSemaphore(value: maxInFlightGenerations)
     /// Unix time this process started serving; /v1/models reports it.
     private let startedAt = Int(Date().timeIntervalSince1970)
 
@@ -74,7 +85,15 @@ public final class Server {
         // which is what `send` already handles by returning false.
         signal(SIGPIPE, SIG_IGN)
         if listenFD < 0 { listenFD = try Self.bindPort(port) }
-        listen(listenFD, 16)
+        guard listen(listenFD, 16) == 0 else {
+            throw ServerError("cannot listen: \(String(cString: strerror(errno)))")
+        }
+        let flags = fcntl(listenFD, F_GETFL, 0)
+        guard flags >= 0, fcntl(listenFD, F_SETFL, flags | O_NONBLOCK) == 0 else {
+            throw ServerError("cannot configure nonblocking listener")
+        }
+        // Unusual listener failures also cancel workers before owner unwinding.
+        defer { lifecycle.cancelConnections() }
         print("slotstream listening on http://127.0.0.1:\(port)")
         print("""
         try it:
@@ -82,17 +101,24 @@ public final class Server {
         or point any Ollama or OpenAI client at http://localhost:\(port)
         """)
         fflush(stdout)  // visible immediately even when stdout is a file/pipe
-        while true {
+        while !lifecycle.isStopping {
+            if progressTimeout > 0, lifecycle.stalled(timeout: progressTimeout) {
+                FileHandle.standardError.write(Data("fatal inference stall: no progress for \(progressTimeout) seconds; exiting 75\n".utf8))
+                _exit(75) // A hung GPU graph cannot be unwound safely.
+            }
+            var listener = pollfd(fd: listenFD, events: Int16(POLLIN), revents: 0)
+            let ready = poll(&listener, 1, 100)
+            if ready < 0 && errno == EINTR { continue }
+            guard ready >= 0 else { throw ServerError("listener poll failed: \(String(cString: strerror(errno)))") }
+            if ready == 0 { continue }
+            if lifecycle.isStopping { break }
             let fd = accept(listenFD, nil, nil)
-            if fd < 0 { continue }
-            // A stalled client must not pin a thread forever: give reads a
-            // deadline, and cap how many connections can be in flight.
-            var tv = timeval(tv_sec: 30, tv_usec: 0)
-            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-            var st = timeval(tv_sec: 120, tv_usec: 0)
-            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &st, socklen_t(MemoryLayout<timeval>.size))
-            var one: Int32 = 1
-            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+            if fd < 0 {
+                if errno == EINTR || errno == ECONNABORTED || errno == EAGAIN || errno == EWOULDBLOCK { continue }
+                throw ServerError("accept failed: \(String(cString: strerror(errno)))")
+            }
+            // Poll-based deadlines require an explicitly nonblocking socket.
+            guard Self.prepareConnection(fd) else { close(fd); continue }
             // Never block the accept loop; see maxConcurrentConnections.
             guard connSlots.wait(timeout: .now()) == .success else {
                 let body = Data(#"{"error":"server busy: too many open connections"}"#.utf8)
@@ -103,151 +129,34 @@ public final class Server {
                 close(fd)
                 continue
             }
-            Thread.detachNewThread { [weak self] in
-                defer { self?.connSlots.signal() }
-                self?.handle(fd)
+            guard lifecycle.register(fd) else { close(fd); connSlots.signal(); continue }
+            Thread.detachNewThread { [weak self, lifecycle, connSlots] in
+                // Release the worker's temporary strong server reference and
+                // autoreleased objects BEFORE announcing completion. Otherwise
+                // pthread TLS cleanup can destroy the Engine after C++ runtime
+                // teardown has already destroyed MLX's compiler cache.
+                autoreleasepool { [weak self] in self?.handle(fd) }
+                lifecycle.finish(fd)
+                connSlots.signal()
             }
         }
+        // Stop accepting immediately, while existing work gets a finite grace
+        // period. Queued/read/write workers are cancelled only after grace.
+        close(listenFD)
+        listenFD = -1
+        FileHandle.standardError.write(Data("shutdown: draining connections (30 seconds)\n".utf8))
+        if !lifecycle.wait(timeout: 30) {
+            lifecycle.cancelConnections()
+            if !lifecycle.wait(timeout: 10) { throw ServerDrainTimedOut() }
+        }
+        FileHandle.standardError.write(Data("shutdown: all connections finished\n".utf8))
+        throw ServerStopped()
     }
 
     // MARK: connection handling
 
-    package struct Request {
-        package init() {}
-        package var method = ""
-        package var path = ""
-        package var body = Data()
-        package var headers: [String: String] = [:]
-    }
-
-    /// Largest request body accepted. Text prompts are tiny, but vision inputs
-    /// (base64-encoded images) commonly reach several MB and must be served.
-    /// The cap still exists to keep the read bounded against an unbounded
-    /// attacker; requests past it get a 413 instead of a dropped connection.
-    package static let maxBodyBytes = 32 << 20
-
-    /// Why a request could not be read. `.closed` means the peer went away or
-    /// timed out, so there is nobody left to tell; everything else gets a real
-    /// status line, because dropping the connection reads as a crash.
-    enum ReadOutcome {
-        case ok(Request)
-        case closed
-        case fail(status: String, message: String)
-    }
-
-    private func readRequest(_ fd: Int32) -> ReadOutcome {
-        var buf = Data()
-        var tmp = [UInt8](repeating: 0, count: 65536)
-        var headerEnd: Range<Data.Index>? = nil
-        while headerEnd == nil {
-            let n = read(fd, &tmp, tmp.count)
-            if n <= 0 { return .closed }
-            buf.append(contentsOf: tmp[0 ..< n])
-            headerEnd = buf.range(of: Data("\r\n\r\n".utf8))
-            if headerEnd == nil, buf.count > 64 << 10 {
-                return .fail(
-                    status: "431 Request Header Fields Too Large",
-                    message: "request headers are larger than 64 KiB")
-            }
-        }
-        let headData = buf[..<headerEnd!.lowerBound]
-        let head = String(data: headData, encoding: .utf8) ?? ""
-        let req: Request
-        let contentLength: Int
-        switch Self.parseHead(head) {
-        case let .fail(status, message): return .fail(status: status, message: message)
-        case let .ok(parsed, length):
-            req = parsed
-            contentLength = length
-        }
-        var body = Data(buf[headerEnd!.upperBound...].prefix(contentLength))
-        while body.count < contentLength {
-            let n = read(fd, &tmp, min(tmp.count, contentLength - body.count))
-            if n <= 0 { break }
-            body.append(contentsOf: tmp[0 ..< n])
-        }
-        guard body.count == contentLength else { return .closed }
-        var complete = req
-        complete.body = body
-        return .ok(complete)
-    }
-
-    /// What the head said, or why the request cannot be served. Split out of
-    /// the socket read so every framing rule below is reachable from a test
-    /// with a string instead of a live server and a real client.
-    package enum HeadOutcome {
-        case ok(Request, contentLength: Int)
-        case fail(status: String, message: String)
-    }
-
-    package static func parseHead(_ head: String) -> HeadOutcome {
-        var req = Request()
-        let lines = head.split(separator: "\r\n", omittingEmptySubsequences: false)
-        let parts = lines.first?.split(separator: " ") ?? []
-        if parts.count >= 2 {
-            req.method = String(parts[0])
-            req.path = String(parts[1])
-        }
-        var contentLength = 0
-        var sawContentLength = false
-        for l in lines.dropFirst() {
-            let kv = l.split(separator: ":", maxSplits: 1)
-            if kv.count == 2 {
-                let key = kv[0].trimmingCharacters(in: .whitespaces).lowercased()
-                let value = kv[1].trimmingCharacters(in: .whitespaces)
-                req.headers[key] = value
-                if key == "content-length" {
-                    sawContentLength = true
-                    contentLength = Int(value) ?? -1
-                }
-            }
-        }
-        // A chunked body carries no Content-Length, so it used to be read as
-        // zero bytes and failed further in as "messages must be an array".
-        if let te = req.headers["transfer-encoding"], te.lowercased().contains("chunked") {
-            return .fail(
-                status: "411 Length Required",
-                message: "chunked request bodies are not supported; send Content-Length")
-        }
-        if sawContentLength, contentLength < 0 {
-            return .fail(status: "400 Bad Request", message: "Content-Length is not a number")
-        }
-        if contentLength > maxBodyBytes {
-            return .fail(
-                status: "413 Content Too Large",
-                message: "request body is larger than \(maxBodyBytes >> 20) MiB")
-        }
-        return .ok(req, contentLength: contentLength)
-    }
-
-    /// The path a request routes on: no query string, and no scheme or
-    /// authority from the absolute-form target proxies send. Both are legal
-    /// HTTP and both used to 404.
-    package static func routePath(_ raw: String) -> String {
-        var p = raw
-        if let q = p.firstIndex(of: "?") { p = String(p[..<q]) }
-        for scheme in ["http://", "https://"] where p.lowercased().hasPrefix(scheme) {
-            let afterScheme = p.index(p.startIndex, offsetBy: scheme.count)
-            if let slash = p[afterScheme...].firstIndex(of: "/") {
-                p = String(p[slash...])
-            } else {
-                p = "/"
-            }
-        }
-        return p.count > 1 && p.hasSuffix("/") ? String(p.dropLast()) : p
-    }
-
     private func send(_ fd: Int32, _ data: Data) -> Bool {
-        var sent = 0
-        return data.withUnsafeBytes { raw -> Bool in
-            while sent < data.count {
-                let n = write(fd, raw.baseAddress! + sent, data.count - sent)
-                if n < 0 && errno == EINTR { continue }
-                if n <= 0 { return false }
-                sent += n
-            }
-            return true
-        }
+        Self.writeResponse(fd, data)
     }
 
     /// Browser clients need CORS, but a wildcard turns any website the user
@@ -294,6 +203,7 @@ public final class Server {
     /// including non-streaming requests that otherwise would not write until
     /// all work had already been done.
     private func peerAlive(_ fd: Int32) -> Bool {
+        if progressTimeout > 0 { lifecycle.progress() }
         var byte: UInt8 = 0
         let n = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT)
         if n == 0 { return false }
@@ -304,9 +214,8 @@ public final class Server {
     // MARK: routing
 
     private func handle(_ fd: Int32) {
-        defer { close(fd) }
         let req: Request
-        switch readRequest(fd) {
+        switch Self.readRequest(fd) {
         case .ok(let r): req = r
         case .closed: return
         case .fail(let status, let message):
@@ -329,6 +238,20 @@ public final class Server {
             _ = send(fd, Data(head.utf8))
             return
         }
+        let path = Self.routePath(req.path)
+        let needsGeneration = Self.requiresGenerationAdmission(method: req.method, path: path)
+        if needsGeneration, generationSlots.wait(timeout: .now()) != .success {
+            respondJSON(fd, ["error": "server busy: inference queue is full"],
+                        status: "503 Service Unavailable", cors: cors + "Retry-After: 1\r\n")
+            return
+        }
+        if needsGeneration, progressTimeout > 0 { lifecycle.beginInference() }
+        defer {
+            if needsGeneration {
+                if progressTimeout > 0 { lifecycle.endInference() }
+                generationSlots.signal()
+            }
+        }
         let parsed = (try? JSONSerialization.jsonObject(with: req.body)) as? [String: Any]
         if req.method == "POST", !req.body.isEmpty, parsed == nil {
             respondJSON(
@@ -336,7 +259,6 @@ public final class Server {
             return
         }
         let json = parsed ?? [:]
-        let path = Self.routePath(req.path)
         switch (req.method, path) {
         case ("GET", "/api/version"):
             respondJSON(fd, ["version": SlotstreamBuild.version], cors: cors)

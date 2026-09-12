@@ -170,6 +170,24 @@ public struct VisionPreprocess {
     /// reports `complete` for that file, because all the data it was given was
     /// given at once — so the container's end marker is checked instead.
     public static func decodeCGImage(_ data: Data) throws -> CGImage {
+        try decodeCGImage(data, pixelBudget: maxSourcePixels)
+    }
+
+    // 128 MiB of RGBA source pixels across a request, before resize. Encoded
+    // byte limits alone do not prevent highly compressed images from forcing
+    // enormous decode/EXIF-rotation allocations. This admits full 8K images.
+    package static let maxSourcePixels = 32 << 20
+
+    package static func sourcePixels(width: Int, height: Int, budget: Int) throws -> Int {
+        let (pixels, overflow) = width.multipliedReportingOverflow(by: height)
+        guard width > 0, height > 0, !overflow, pixels <= budget else {
+            throw VisionError.msg("source images exceed the request pixel budget (33,554,432 pixels total); resize images before sending")
+        }
+        return pixels
+    }
+
+    package static func decodeCGImage(_ data: Data, pixelBudget: Int) throws -> CGImage {
+        try ImageContainer.validatePNG(data)
         guard let src = CGImageSourceCreateWithData(data as CFData, nil),
             CGImageSourceGetCount(src) > 0
         else {
@@ -181,10 +199,17 @@ public struct VisionPreprocess {
                 "image data is incomplete — it ends mid-file, so it was probably "
                     + "truncated in transit; send the whole picture")
         }
+        let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
+        guard let width = props?[kCGImagePropertyPixelWidth] as? Int,
+              let height = props?[kCGImagePropertyPixelHeight] as? Int else {
+            throw VisionError.msg("image dimensions are missing")
+        }
+        _ = try sourcePixels(width: width, height: height, budget: pixelBudget)
         guard let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
             throw VisionError.msg("failed to decode image")
         }
-        let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
+        // Check the decoder result too, before upright() allocates a bitmap.
+        _ = try sourcePixels(width: cg.width, height: cg.height, budget: pixelBudget)
         let orientation = (props?[kCGImagePropertyOrientation] as? UInt32) ?? 1
         return try upright(cg, orientation: orientation)
     }
@@ -283,24 +308,30 @@ public struct VisionPreprocess {
         let bytesPerRow = w * 4
         var raw = [UInt8](repeating: 0, count: h * bytesPerRow)
         let colorSpace = CGColorSpaceCreateDeviceRGB()
-        guard let ctx = CGContext(data: &raw, width: w, height: h, bitsPerComponent: 8, bytesPerRow: bytesPerRow, space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue) else {
-            return [Float](repeating: 0, count: 3 * h * w)
+        // CGContext borrows these bytes until drawing finishes. An implicit
+        // &raw conversion only guarantees their lifetime during the initializer.
+        let drawn = raw.withUnsafeMutableBytes { pixels -> Bool in
+            guard let ctx = CGContext(data: pixels.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: bytesPerRow, space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue) else {
+                return false
+            }
+            ctx.interpolationQuality = .high
+            // Composite onto white, not onto the zeroed buffer.
+            //
+            // The context is premultiplied, so a transparent pixel drawn over
+            // fresh memory comes out black. That is not a subtle difference for
+            // the images people actually send: a logo, a chart, a diagram or a
+            // screenshot exported with transparency is usually dark content on
+            // nothing, and on black it is dark content on black. Measured before
+            // this line existed, black text on a transparent background made the
+            // model answer "the image is entirely black, with no discernible
+            // features" — the picture did not survive the decoder. White is what
+            // every viewer composites onto, so it is what the sender saw.
+            ctx.setFillColor(gray: 1, alpha: 1)
+            ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
         }
-        ctx.interpolationQuality = .high
-        // Composite onto white, not onto the zeroed buffer.
-        //
-        // The context is premultiplied, so a transparent pixel drawn over
-        // fresh memory comes out black. That is not a subtle difference for
-        // the images people actually send: a logo, a chart, a diagram or a
-        // screenshot exported with transparency is usually dark content on
-        // nothing, and on black it is dark content on black. Measured before
-        // this line existed, black text on a transparent background made the
-        // model answer "the image is entirely black, with no discernible
-        // features" — the picture did not survive the decoder. White is what
-        // every viewer composites onto, so it is what the sender saw.
-        ctx.setFillColor(gray: 1, alpha: 1)
-        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
-        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        guard drawn else { return [Float](repeating: 0, count: 3 * h * w) }
         // Convert to CHW normalized
         let plane = h * w
         var chw = [Float](repeating: 0, count: 3 * plane)

@@ -44,14 +44,19 @@ enum ModelProcessGuard {
         defer { stateLock.unlock() }
         if lockFD >= 0 { return }
         let path = "/tmp/slotstream-model-\(getuid()).lock"
-        let fd = open(path, O_RDWR | O_CREAT, 0o600)
+        let fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_NONBLOCK, 0o600)
         guard fd >= 0 else {
             throw ModelError("cannot create model-process lock at \(path): \(String(cString: strerror(errno)))")
+        }
+        var info = stat()
+        guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_nlink == 1, info.st_uid == getuid() else {
+            close(fd)
+            throw ModelError("model-process lock must be an owned regular file with a single link")
         }
         guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
             close(fd)
             throw ModelError(
-                "another Slotstream model process is already running for this user — "
+                "another Slotstream model process or build is already running for this user — "
                     + "stop it before starting run, serve, parity, or a heavyweight check")
         }
         lockFD = fd

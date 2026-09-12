@@ -171,30 +171,36 @@ public final class MemoryGovernor {
     }
 
     public func start() {
-        // Startup sizing counts as the first resize: launch-time availability
-        // can undercount for a minute (page reclaim lag from a predecessor
-        // process), and growing on that transient reading causes churn.
-        lastResizeAt = Date()
-        let p = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: queue)
-        p.setEventHandler { [weak self] in
-            guard let self, let src = self.pressure else { return }
-            self.onPressure(critical: src.data.contains(.critical))
+        queue.sync {
+            guard timer == nil, pressure == nil else { return }
+            // Startup sizing counts as the first resize; availability can
+            // undercount briefly while a predecessor's pages are reclaimed.
+            lastResizeAt = Date()
+            let p = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: queue)
+            p.setEventHandler { [weak self] in
+                guard let self, let src = self.pressure else { return }
+                self.onPressure(critical: src.data.contains(.critical))
+            }
+            pressure = p
+            p.resume()
+            let t = DispatchSource.makeTimerSource(queue: queue)
+            t.schedule(deadline: .now() + Self.pollInterval, repeating: Self.pollInterval)
+            t.setEventHandler { [weak self] in self?.poll() }
+            timer = t
+            t.resume()
+            log("on — cache auto-resizes with memory availability between requests (--no-elastic to pin)")
         }
-        p.resume()
-        pressure = p
-        let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now() + Self.pollInterval, repeating: Self.pollInterval)
-        t.setEventHandler { [weak self] in self?.poll() }
-        t.resume()
-        timer = t
-        log("on — cache auto-resizes with memory availability between requests (--no-elastic to pin)")
     }
 
+    /// Serialize cancellation with callbacks and drain any in-progress resize.
+    /// Call outside Engine.withExclusive, as with the other governor entrypoints.
     public func stop() {
-        pressure?.cancel()
-        timer?.cancel()
-        pressure = nil
-        timer = nil
+        queue.sync {
+            pressure?.cancel()
+            timer?.cancel()
+            pressure = nil
+            timer = nil
+        }
     }
 
     /// What auto would choose if slotstream restarted right now: reclaimable
@@ -212,7 +218,7 @@ public final class MemoryGovernor {
         }
         let now = Date()
         return GovernorPolicy.Inputs(
-            currentSlots: engine.model.pool.slots,
+            currentSlots: engine.poolSnapshot().slots,
             availableGB: avail,
             ramGB: cur.ramGB,
             workingSetGB: cur.workingSetGB,
@@ -240,7 +246,7 @@ public final class MemoryGovernor {
     /// `Planner.availabilityOverride` so that path is covered without putting
     /// the machine under real memory pressure, which is the one way this had
     /// never been exercised on a shipped build.
-    public func pollNow() { act(nil) }
+    public func pollNow() { queue.sync { act(nil) } }
 
     private func act(_ pressure: GovernorPolicy.Pressure?) {
         guard let i = inputs(pressure: pressure) else { return }

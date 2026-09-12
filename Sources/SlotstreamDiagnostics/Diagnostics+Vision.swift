@@ -21,6 +21,17 @@ extension Diagnostics {
         let cfg = VisionConfig()
         let bounds = VisionPreprocess.effectiveBounds(cfgMin: 65536, cfgMax: 16_777_216)
 
+        for (width, height, budget, accepted) in [
+            (7680, 4320, VisionPreprocess.maxSourcePixels, true),
+            (8192, 4096, VisionPreprocess.maxSourcePixels, true),
+            (8192, 4097, VisionPreprocess.maxSourcePixels, false),
+            (1, 1, 0, false), (0, 1, 100, false), (-1, 1, 100, false),
+            (Int.max, 2, Int.max, false), (10, 10, 99, false),
+        ] {
+            let result = try? VisionPreprocess.sourcePixels(width: width, height: height, budget: budget)
+            c.equal("source pixel boundary \(width)x\(height) / \(budget)", result != nil, accepted)
+        }
+
         // MARK: geometry
         //
         // `smart_resize` rounds each side to a multiple of patch × merge with
@@ -115,6 +126,10 @@ extension Diagnostics {
         // A real (tiny) PNG decodes; a truncated one does not.
         let png = (try? VisionPreprocess.loadImageData(from: onePixelPNG)) ?? Data()
         c.expect("the fixture decodes to an image", (try? VisionPreprocess.decodeCGImage(png)) != nil)
+        c.expect("decoder rejects an exhausted cumulative image budget",
+                 (try? VisionPreprocess.decodeCGImage(png, pixelBudget: 0)) == nil)
+        c.expect("decoder accepts an exactly fitting source budget",
+                 (try? VisionPreprocess.decodeCGImage(png, pixelBudget: 1)) != nil)
         c.expect(
             "half a PNG does not",
             (try? VisionPreprocess.decodeCGImage(png.prefix(20))) == nil)
@@ -126,10 +141,38 @@ extension Diagnostics {
         // background reached the model as black on black and it answered "the
         // image is entirely black, with no discernible features".
         //
+        // A half-transparent red pixel must contribute color. A blank failed
+        // draw onto white cannot pass this companion to the clear-image check.
+        if let red = try? VisionPreprocess.decodeCGImage(Data(base64Encoded: onePixelPNG)!) {
+            let pixels = VisionPreprocess.resizeAndNormalize(cg: red, targetH: 32, targetW: 32)
+            c.expect("half-transparent red actually draws onto white",
+                     pixels.count == 3072 && pixels[0] > 0.99
+                     && abs(pixels[1024]) < 0.02 && abs(pixels[2048]) < 0.02)
+        } else { c.expect("half-transparent red decodes", false) }
+
         // A 1x1 fully transparent PNG, resized to the smallest grid: every
         // channel must normalize to +1 (white), never -1 (black).
         let clearPNG =
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA360e5gAAAABJRU5ErkJggg=="
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII="
+        // The previous fixture had a corrupt IDAT checksum: drawing silently
+        // failed onto the white background, so the transparency assertion passed.
+        let corruptPNG = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA360e5gAAAABJRU5ErkJggg==")!
+        c.expect("corrupt IDAT is rejected before lazy decoding",
+                 (try? VisionPreprocess.decodeCGImage(corruptPNG)) == nil)
+        let intactPNG = Data(base64Encoded: clearPNG)!
+        c.expect("valid PNG checksums pass", (try? ImageContainer.validatePNG(intactPNG)) != nil)
+        for index in [16, 40, intactPNG.count - 1] {
+            var corrupt = intactPNG
+            corrupt[index] ^= 1
+            c.expect("PNG corruption at byte \(index) is rejected",
+                     (try? ImageContainer.validatePNG(corrupt)) == nil)
+        }
+        var oversizedChunk = intactPNG
+        oversizedChunk.replaceSubrange(8..<12, with: [255, 255, 255, 255])
+        c.expect("oversized PNG chunk length is bounded",
+                 (try? ImageContainer.validatePNG(oversizedChunk)) == nil)
+        c.expect("truncated PNG checksum is bounded",
+                 (try? ImageContainer.validatePNG(intactPNG.dropLast())) == nil)
         if let bytes = try? VisionPreprocess.loadImageData(from: clearPNG),
             let clear = try? VisionPreprocess.decodeCGImage(bytes)
         {
@@ -137,6 +180,13 @@ extension Diagnostics {
             c.expect(
                 "a transparent pixel composites onto white, not onto black",
                 pixels.allSatisfy { $0 > 0.99 })
+            // Repeated contexts exercise the borrowed-buffer lifetime with
+            // different allocation sizes; no model or GPU is involved.
+            for size: UInt32 in [16, 32, 48, 64, 16, 64, 32, 48] {
+                let repeated = VisionPreprocess.resizeAndNormalize(cg: clear, targetH: size, targetW: size)
+                c.expect("repeated bitmap draw at \(size) preserves white pixels",
+                         repeated.count == 3 * Int(size * size) && repeated.allSatisfy { $0 > 0.99 })
+            }
         } else {
             c.expect("the transparent fixture decodes", false)
         }

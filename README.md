@@ -123,6 +123,8 @@ is not included.
 - [Exact profiles and baseline policy](docs/CONFIGURATION.md)
 - [Consolidated performance findings and limitations](docs/FINDINGS.md)
 - [Package validation](docs/VALIDATION.md)
+- [Verification commands](docs/TESTING.md)
+- [Production review and remaining risks](docs/PRODUCTION_REVIEW.md)
 - [Source provenance](provenance/acd.json)
 
 The 30 GB ACD software study passed all original quality checks on this M5 Max;

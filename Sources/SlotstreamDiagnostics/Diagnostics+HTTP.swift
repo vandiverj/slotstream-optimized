@@ -75,6 +75,29 @@ extension Diagnostics {
         } else {
             c.expect("no Content-Length means no body", false)
         }
+        for lines in [
+            ["POST /api/chat HTTP/1.1", "Content-Length: 10", "Content-Length: 2"],
+            ["POST /api/chat HTTP/1.1", "Content-Length: +2"],
+            ["POST /api/chat HTTP/1.1", "Content-Length:"],
+            ["POST /api/chat HTTP/1.1", "Content-Length: 999999999999999999999999"],
+            ["POST /api/chat"],
+            ["GET / HTTP/2"],
+            ["GET / HTTP/1.1", "Broken header"],
+            ["GET / HTTP/1.1", "Origin: http://localhost\nInjected: value"],
+        ] {
+            c.equal("malformed framing rejected: \(lines)",
+                    failure(Server.parseHead(head(lines)))?.0, "400 Bad Request")
+        }
+        c.equal("repeated matching lengths are accepted",
+                ok(Server.parseHead(head(["POST / HTTP/1.1", "Content-Length: 2", "content-length: 2"])))?.1, 2)
+        c.equal("unsupported transfer encoding is refused",
+                failure(Server.parseHead(head(["POST / HTTP/1.1", "Transfer-Encoding: gzip"])))?.0,
+                "411 Length Required")
+        let prefix = "GET / HTTP/1.1\r\nX-Padding: "
+        let atLimit = prefix + String(repeating: "a", count: (64 << 10) - prefix.utf8.count)
+        c.expect("headers exactly at the limit are accepted", ok(Server.parseHead(atLimit)) != nil)
+        c.equal("terminated oversized headers are refused",
+                failure(Server.parseHead(atLimit + "a"))?.0, "431 Request Header Fields Too Large")
         c.measure("max_body_bytes", Double(Server.maxBodyBytes))
         return c.report()
     }
@@ -98,6 +121,18 @@ extension Diagnostics {
                 Server.routePath("http://127.0.0.1:11434"), "/")
         c.equal("...with the query still stripped",
                 Server.routePath("http://127.0.0.1:11434/api/ps?x=1"), "/api/ps")
+
+        for path in ["/api/chat", "/api/generate", "/v1/chat/completions",
+                     "/v3/ai/language-model", "/v1/ai/language-model",
+                     "http://localhost/v1/chat/completions/?q=1"] {
+            c.expect("generation route admission: \(path)",
+                     Server.requiresGenerationAdmission(method: "POST", path: path))
+        }
+        for (method, path) in [("GET", "/api/ps"), ("GET", "/api/version"),
+                               ("POST", "/api/show"), ("OPTIONS", "/v1/chat/completions")] {
+            c.expect("metadata/preflight bypass inference admission: \(path)",
+                     !Server.requiresGenerationAdmission(method: method, path: path))
+        }
 
         // CORS: a wildcard would turn any website the user visits into an
         // unauthenticated caller of an expensive local model.

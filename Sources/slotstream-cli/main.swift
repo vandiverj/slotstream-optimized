@@ -354,12 +354,21 @@ struct Serve: ParsableCommand {
           help: "Re-prefill every request from scratch. Default: the state of one request is reused by the next when that request's prompt extends it, so a chat turn only prefills what is new.")
     var noPrefixCache = false
 
+    @Option(name: .customLong("stall-timeout-seconds"),
+            help: "Exit 75 after this many seconds without inference progress; 0 disables the watchdog. Choose a value above legitimate per-step and network-write delays.")
+    var stallTimeoutSeconds: Double = 0
+
     func run() throws {
+        guard stallTimeoutSeconds.isFinite, stallTimeoutSeconds >= 0 else {
+            throw ValidationError("--stall-timeout-seconds must be finite and nonnegative")
+        }
         if let why = ContextPolicy.validationError(maxContext) { throw PlanError(why) }
         let plan = try model.announcedPlan(maxContext: maxContext)
         // Claim the port first: failing here after a full model load wastes
         // half a minute and used to be a fatalError.
         let listenFD = try Server.bindPort(port)
+        var portTransferred = false
+        defer { if !portTransferred { close(listenFD) } }
         let sem = DispatchSemaphore(value: 0)
         var engine: Engine!
         var err: Error?
@@ -399,7 +408,32 @@ struct Serve: ParsableCommand {
         let server = Server(
             engine: engine, port: port, weightsBytes: Int(PinnedModel.totalBytes),
             listenFD: listenFD)
-        try server.run()
+        server.progressTimeout = stallTimeoutSeconds
+        portTransferred = true // Server owns the descriptor, including run() failure.
+        // Install handlers only after model initialization. Dispatch handlers
+        // run outside signal context and never touch GPU work directly.
+        let previousTERM = signal(SIGTERM, SIG_IGN)
+        let previousINT = signal(SIGINT, SIG_IGN)
+        let signalQueue = DispatchQueue(label: "slotstream.shutdown-signals")
+        let signals = [SIGTERM, SIGINT].map { number -> DispatchSourceSignal in
+            let source = DispatchSource.makeSignalSource(signal: number, queue: signalQueue)
+            source.setEventHandler { [weak server] in server?.requestShutdown() }
+            source.resume()
+            return source
+        }
+        defer {
+            signals.forEach { $0.cancel() }
+            signalQueue.sync {} // Drain any in-flight handler before releasing the engine.
+            signal(SIGTERM, previousTERM)
+            signal(SIGINT, previousINT)
+        }
+        do { try server.run() }
+        catch is ServerStopped { return }
+        catch is ServerDrainTimedOut {
+            // A stuck GPU call cannot be safely interrupted/unwound in process.
+            FileHandle.standardError.write(Data("shutdown: cleanup deadline exceeded; exiting 124\n".utf8))
+            _exit(124)
+        }
     }
 }
 
