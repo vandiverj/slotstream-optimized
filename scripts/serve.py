@@ -5,14 +5,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-def configuration(profile, model, port):
+def configuration(profile, model, port, prefix_cache=False):
     cfg = json.loads((ROOT / 'profiles' / (profile + '.json')).read_text())
     binary = ROOT / cfg['engine'] / '.build/release/slotstream'
     env = {k: v for k, v in os.environ.items() if not k.startswith(('SLOTSTREAM_', 'MLX_', 'SS_DEBUG_'))}
     env.update(cfg['environment'])
     common = ['--model', str(Path(model).expanduser().resolve()), '--experts-per-layer', str(cfg['experts']),
               '--mtp', cfg['mtp'], '--max-context', str(cfg['max_context'])]
-    argv = [str(binary), 'serve', '--port', str(port), '--no-prefix-cache'] + common
+    argv = [str(binary), 'serve', '--port', str(port)] + ([] if prefix_cache else ['--no-prefix-cache']) + common
+    if prefix_cache:
+        # Opt-in: reuse the previous request's state when the next prompt extends it (chat turns,
+        # tool loops). Output is equivalent but not byte-identical to a cold run; see prefix-check.
+        env['SLOTSTREAM_PREFIX_CACHE'] = '1'
     return cfg, binary, env, common, argv
 
 def preflight(binary, env, common, cfg, profile):
@@ -42,16 +46,17 @@ def main():
     parser.add_argument('--port', type=int, default=11434)
     parser.add_argument('--stall-timeout-seconds', type=float, default=0, help='Optional inference-progress watchdog; exits 75 on a stall (0 disables it)')
     parser.add_argument('--supervise', action='store_true', help='Restart failed processes at most three times with fresh preflight; never replay requests')
+    parser.add_argument('--prefix-cache', action='store_true', help='Reuse conversation prefixes between requests (off in the qualified profiles; verify with slotstream prefix-check)')
     parser.add_argument('--dry-run', action='store_true', help='Show exact arguments and profile environment without loading the model')
     args = parser.parse_args()
     if not 1 <= args.port <= 65535: parser.error('port must be between 1 and 65535')
     if not math.isfinite(args.stall_timeout_seconds) or args.stall_timeout_seconds < 0:
         parser.error('stall timeout must be finite and nonnegative')
-    cfg, binary, env, common, argv = configuration(args.profile, args.model, args.port)
+    cfg, binary, env, common, argv = configuration(args.profile, args.model, args.port, args.prefix_cache)
     if args.stall_timeout_seconds:
         argv += ['--stall-timeout-seconds', str(args.stall_timeout_seconds)]
     if args.dry_run:
-        print(json.dumps({'argv': argv, 'environment': cfg['environment'], 'clear_inherited_prefixes': ['SLOTSTREAM_', 'MLX_', 'SS_DEBUG_']}, indent=2))
+        print(json.dumps({'argv': argv, 'environment': {k: env[k] for k in cfg['environment']}, 'clear_inherited_prefixes': ['SLOTSTREAM_', 'MLX_', 'SS_DEBUG_']}, indent=2))
         return
     if not binary.is_file(): parser.error('Build this profile first with scripts/build.sh ' + args.profile)
     if not Path(args.model).expanduser().is_dir(): parser.error('Model directory missing; download with slotstream pull or pass --model PATH')
